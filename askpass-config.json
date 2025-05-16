@@ -1,0 +1,6 @@
+{
+    "require_user_confirmation": true,
+    "allowed_paths": ["/"],
+    "expiration_hours": 24,
+    "allowed_processes": ["sudo", "claude-code", "code", "bash", "sh"]
+}

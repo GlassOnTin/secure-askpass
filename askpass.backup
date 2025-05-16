@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""
+Askpass helper that retrieves passwords using secure methods only
+"""
+
+import sys
+import os
+import subprocess
+
+# Try keyring as backup
+try:
+    import keyring
+    HAS_KEYRING = True
+except ImportError:
+    HAS_KEYRING = False
+
+SERVICE_NAME = "sudo-askpass"
+USERNAME = "sudo"
+SSH_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.ssh")
+SSH_KEY = os.path.expanduser("~/.ssh/id_rsa")
+
+def decrypt_with_ssh_key(encrypted_file):
+    """Decrypt data using SSH private key"""
+    if not os.path.exists(SSH_KEY):
+        return None
+        
+    try:
+        with open(encrypted_file, 'rb') as f:
+            encrypted_data = f.read()
+        
+        # First try direct decryption (for PKCS8 format keys)
+        result = subprocess.run(
+            ['openssl', 'pkeyutl', '-decrypt', '-inkey', SSH_KEY],
+            input=encrypted_data,
+            capture_output=True
+        )
+        
+        if result.returncode == 0:
+            return result.stdout.decode('utf-8').strip()
+        
+        # If that fails, convert key format first
+        temp_pem = '/tmp/ssh_key_pem.tmp'
+        convert_result = subprocess.run(
+            ['openssl', 'rsa', '-in', SSH_KEY, '-out', temp_pem],
+            capture_output=True
+        )
+        
+        if convert_result.returncode == 0:
+            # Try decryption with converted key
+            result = subprocess.run(
+                ['openssl', 'pkeyutl', '-decrypt', '-inkey', temp_pem],
+                input=encrypted_data,
+                capture_output=True
+            )
+            
+            # Clean up temp file
+            os.remove(temp_pem)
+            
+            if result.returncode == 0:
+                return result.stdout.decode('utf-8').strip()
+    
+    except Exception:
+        pass
+    
+    return None
+
+def main():
+    password = None
+    
+    # Priority 1: SSH encrypted file
+    if os.path.exists(SSH_ENCRYPTED_FILE):
+        password = decrypt_with_ssh_key(SSH_ENCRYPTED_FILE)
+        if password:
+            print(password)
+            return
+    
+    # Priority 2: Keyring
+    if HAS_KEYRING and password is None:
+        try:
+            password = keyring.get_password(SERVICE_NAME, USERNAME)
+            if password:
+                print(password)
+                return
+        except Exception:
+            pass
+    
+    # No insecure fallbacks - require secure storage
+    
+    # No password found
+    print("Error: No password found in secure storage", file=sys.stderr)
+    print("Use 'askpass-manager set' to store the password securely", file=sys.stderr)
+    print("Secure storage methods: SSH encryption or system keyring", file=sys.stderr)
+    sys.exit(1)
+
+if __name__ == "__main__":
+    main()

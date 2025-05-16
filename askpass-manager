@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""
+Askpass manager that uses SSH key encryption by default
+"""
+
+import sys
+import subprocess
+import os
+import getpass
+import socket
+
+try:
+    import keyring
+    HAS_KEYRING = True
+except ImportError:
+    HAS_KEYRING = False
+
+SERVICE_NAME = "sudo-askpass"
+USERNAME = "sudo"
+SSH_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.ssh")
+SSH_KEY = os.path.expanduser("~/.ssh/id_rsa")
+SSH_PUB = os.path.expanduser("~/.ssh/id_rsa.pub")
+
+def extract_pubkey_for_openssl():
+    """Convert SSH public key to OpenSSL format"""
+    try:
+        # First extract the public key in PEM format
+        result = subprocess.run(
+            ['ssh-keygen', '-e', '-m', 'PKCS8', '-f', SSH_PUB],
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode == 0:
+            # Save to temporary file
+            temp_pem = '/tmp/ssh_pubkey.pem'
+            with open(temp_pem, 'w') as f:
+                f.write(result.stdout)
+            return temp_pem
+        
+    except Exception:
+        pass
+    
+    return None
+
+def encrypt_with_ssh_key(password):
+    """Encrypt password with SSH public key"""
+    try:
+        # Extract public key in OpenSSL format
+        pem_pubkey = extract_pubkey_for_openssl()
+        if not pem_pubkey:
+            return None
+        
+        # Encrypt with public key
+        result = subprocess.run(
+            ['openssl', 'pkeyutl', '-encrypt', '-pubin', '-inkey', pem_pubkey],
+            input=password.encode(),
+            capture_output=True
+        )
+        
+        # Clean up temp file
+        os.remove(pem_pubkey)
+        
+        if result.returncode == 0:
+            return result.stdout
+        
+    except Exception:
+        pass
+    
+    return None
+
+def set_password():
+    """Store password encrypted with SSH key (primary) or other fallbacks"""
+    print("Storing your sudo password...")
+    
+    # Get password
+    password = getpass.getpass("Enter sudo password to store: ")
+    confirm = getpass.getpass("Confirm password: ")
+    
+    if password != confirm:
+        print("Error: Passwords don't match", file=sys.stderr)
+        return False
+    
+    # Priority 1: Try SSH encryption
+    if os.path.exists(SSH_KEY) and os.path.exists(SSH_PUB):
+        print("Using SSH key encryption...")
+        encrypted = encrypt_with_ssh_key(password)
+        
+        if encrypted:
+            try:
+                with open(SSH_ENCRYPTED_FILE, 'wb') as f:
+                    f.write(encrypted)
+                os.chmod(SSH_ENCRYPTED_FILE, 0o600)
+                print(f"Password encrypted with SSH key and stored in {SSH_ENCRYPTED_FILE}")
+                return True
+            except Exception as e:
+                print(f"Error saving SSH encrypted file: {e}")
+    else:
+        print("SSH keys not found, trying other methods...")
+    
+    # Priority 2: Try keyring
+    if HAS_KEYRING:
+        try:
+            keyring.set_password(SERVICE_NAME, USERNAME, password)
+            print("Password stored successfully in keyring")
+            return True
+        except Exception as e:
+            print(f"Keyring storage failed: {e}")
+    
+    # No more insecure fallbacks
+    print("Error: Unable to store password securely", file=sys.stderr)
+    print("Please ensure you have either:")
+    print("  - SSH keys (~/.ssh/id_rsa) for encryption")
+    print("  - A working keyring system")
+    return False
+
+def get_password():
+    """Check for stored password in priority order"""
+    # Check SSH encrypted file
+    if os.path.exists(SSH_ENCRYPTED_FILE):
+        print("Password found (SSH encrypted)")
+        return True
+    
+    # Check keyring
+    if HAS_KEYRING:
+        try:
+            password = keyring.get_password(SERVICE_NAME, USERNAME)
+            if password:
+                print("Password found in keyring")
+                return True
+        except Exception:
+            pass
+    
+    print("No password found")
+    return False
+
+def clear_password():
+    """Clear all stored passwords"""
+    cleared = False
+    
+    # Clear SSH encrypted file
+    if os.path.exists(SSH_ENCRYPTED_FILE):
+        try:
+            os.remove(SSH_ENCRYPTED_FILE)
+            print("SSH encrypted password cleared")
+            cleared = True
+        except Exception as e:
+            print(f"Error clearing SSH encrypted file: {e}")
+    
+    # Clear from keyring
+    if HAS_KEYRING:
+        try:
+            keyring.delete_password(SERVICE_NAME, USERNAME)
+            print("Password cleared from keyring")
+            cleared = True
+        except Exception:
+            pass
+    
+    # Clear legacy files if they exist (cleanup)
+    legacy_files = [
+        os.path.expanduser("~/.sudo_askpass.enc"),
+        os.path.expanduser("~/.sudo_askpass"),
+        os.path.expanduser("~/.sudo_askpass.gpg")
+    ]
+    
+    for file_path in legacy_files:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                print(f"Cleared legacy file: {file_path}")
+                cleared = True
+            except Exception as e:
+                print(f"Error clearing {file_path}: {e}")
+    
+    if not cleared:
+        print("No password found to clear")
+    
+    return cleared
+
+def test_sudo():
+    """Test sudo with askpass"""
+    askpass_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'askpass')
+    
+    if not os.path.exists(askpass_path):
+        print(f"Error: askpass script not found at {askpass_path}", file=sys.stderr)
+        return False
+    
+    # Make sure askpass is executable
+    os.chmod(askpass_path, 0o755)
+    
+    # Test with a simple command
+    env = os.environ.copy()
+    env['SUDO_ASKPASS'] = askpass_path
+    
+    print("Testing sudo with askpass...")
+    result = subprocess.run(['sudo', '-A', 'echo', 'Success!'], 
+                           env=env, capture_output=True, text=True)
+    
+    if result.returncode == 0:
+        print("Test successful:", result.stdout.strip())
+        return True
+    else:
+        print("Test failed:", result.stderr.strip(), file=sys.stderr)
+        return False
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: askpass-manager [set|get|clear|test]")
+        print()
+        print("Commands:")
+        print("  set   - Store password (SSH encryption by default)")
+        print("  get   - Check if password exists")
+        print("  clear - Remove stored password")
+        print("  test  - Test sudo with askpass")
+        print()
+        print("Storage methods (secure only):")
+        print("  1. SSH key encryption (default if SSH keys exist)")
+        print("  2. System keyring")
+        sys.exit(1)
+    
+    command = sys.argv[1]
+    
+    if command == "set":
+        success = set_password()
+    elif command == "get":
+        success = get_password()
+    elif command == "clear":
+        success = clear_password()
+    elif command == "test":
+        success = test_sudo()
+    else:
+        print(f"Unknown command: {command}", file=sys.stderr)
+        success = False
+    
+    sys.exit(0 if success else 1)
+
+if __name__ == "__main__":
+    main()

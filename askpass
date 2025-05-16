@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""
+Askpass helper with GUI confirmation dialog and enhanced security
+"""
+
+import sys
+import os
+import subprocess
+import time
+import syslog
+import socket
+
+# GUI imports
+try:
+    import tkinter as tk
+    from tkinter import messagebox
+    HAS_GUI = True
+except ImportError:
+    HAS_GUI = False
+
+# Alternative GUI with GTK
+try:
+    import gi
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gtk, GLib
+    HAS_GTK = True
+except ImportError:
+    HAS_GTK = False
+
+# Try keyring as backup
+try:
+    import keyring
+    HAS_KEYRING = True
+except ImportError:
+    HAS_KEYRING = False
+
+SERVICE_NAME = "sudo-askpass"
+USERNAME = "sudo"
+SSH_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.ssh")
+SSH_KEY = os.path.expanduser("~/.ssh/id_rsa")
+CONFIG_FILE = os.path.expanduser("~/.config/secure-askpass/config.json")
+
+# Default security configurations
+DEFAULT_CONFIG = {
+    "require_user_confirmation": True,
+    "allowed_paths": ["/home/ian/", "/tmp/"],
+    "expiration_hours": 24,
+    "allowed_processes": ["sudo", "claude-code", "code", "bash", "sh"]
+}
+
+# Load configuration
+def load_config():
+    config = DEFAULT_CONFIG.copy()
+    
+    # Try to load from user config directory first
+    if os.path.exists(CONFIG_FILE):
+        try:
+            import json
+            with open(CONFIG_FILE, 'r') as f:
+                user_config = json.load(f)
+                config.update(user_config)
+        except:
+            pass
+    
+    # Try to load from script directory
+    local_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'askpass-config.json')
+    if os.path.exists(local_config):
+        try:
+            import json
+            with open(local_config, 'r') as f:
+                user_config = json.load(f)
+                config.update(user_config)
+        except:
+            pass
+    
+    return config
+
+config = load_config()
+ALLOWED_PATHS = config['allowed_paths']
+EXPIRATION_HOURS = config['expiration_hours']
+ALLOWED_PARENT_PROCESSES = config['allowed_processes']
+REQUIRE_USER_CONFIRMATION = config['require_user_confirmation']
+
+def get_sudo_command():
+    """Try to determine what command sudo is trying to run"""
+    try:
+        # Get parent process command line
+        ppid = os.getppid()
+        with open(f'/proc/{ppid}/cmdline', 'r') as f:
+            cmdline = f.read().replace('\0', ' ').strip()
+            # Extract the actual command after sudo flags
+            parts = cmdline.split()
+            if 'sudo' in parts[0]:
+                # Find the actual command (skip sudo and its flags)
+                for i, part in enumerate(parts):
+                    if not part.startswith('-') and part != 'sudo':
+                        return ' '.join(parts[i:])
+        return "Unknown command"
+    except:
+        return "Unknown command"
+
+def show_confirmation_dialog():
+    """Show GUI confirmation dialog for sudo access"""
+    command = get_sudo_command()
+    hostname = socket.gethostname()
+    user = os.environ.get('USER', 'unknown')
+    
+    # Try Tkinter first
+    if HAS_GUI and 'DISPLAY' in os.environ:
+        try:
+            root = tk.Tk()
+            root.withdraw()  # Hide the main window
+            root.attributes('-topmost', True)  # Bring to front
+            
+            # Create dialog message
+            message = f"Administrator privileges requested\n\n"
+            message += f"User: {user}\n"
+            message += f"Host: {hostname}\n"
+            message += f"Command: {command}\n\n"
+            message += "Do you want to allow this?"
+            
+            result = messagebox.askyesno(
+                "Sudo Authentication Required",
+                message,
+                icon=messagebox.WARNING
+            )
+            root.destroy()
+            return result
+        except Exception as e:
+            syslog.syslog(syslog.LOG_WARNING, f"Tkinter dialog failed: {e}")
+    
+    # Try GTK as fallback
+    if HAS_GTK and 'DISPLAY' in os.environ:
+        try:
+            dialog = Gtk.MessageDialog(
+                parent=None,
+                modal=True,
+                message_type=Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.YES_NO,
+                text="Administrator privileges requested"
+            )
+            dialog.format_secondary_text(
+                f"User: {user}\n"
+                f"Host: {hostname}\n"
+                f"Command: {command}\n\n"
+                f"Do you want to allow this?"
+            )
+            dialog.set_keep_above(True)
+            dialog.set_urgency_hint(True)
+            
+            response = dialog.run()
+            dialog.destroy()
+            return response == Gtk.ResponseType.YES
+        except Exception as e:
+            syslog.syslog(syslog.LOG_WARNING, f"GTK dialog failed: {e}")
+    
+    # Fallback to zenity if available
+    if 'DISPLAY' in os.environ:
+        try:
+            message = f"Administrator privileges requested\\n\\n"
+            message += f"User: {user}\\n"
+            message += f"Host: {hostname}\\n"
+            message += f"Command: {command}\\n\\n"
+            message += "Do you want to allow this?"
+            
+            result = subprocess.run(
+                ['zenity', '--question', '--title=Sudo Authentication Required',
+                 f'--text={message}', '--width=400'],
+                capture_output=True
+            )
+            return result.returncode == 0
+        except:
+            pass
+    
+    # If GUI is required but not available, deny by default
+    if 'DISPLAY' not in os.environ:
+        syslog.syslog(syslog.LOG_ERR, "No display available for confirmation dialog")
+    return False
+
+def check_security():
+    """Perform security checks before retrieving password"""
+    # 1. Path-based restriction
+    cwd = os.getcwd()
+    if not any(cwd.startswith(path) for path in ALLOWED_PATHS):
+        syslog.syslog(syslog.LOG_WARNING, f"Askpass called from unauthorized path: {cwd}")
+        return False
+    
+    # 2. Process validation
+    try:
+        ppid = os.getppid()
+        proc_name = open(f'/proc/{ppid}/comm').read().strip()
+        if proc_name not in ALLOWED_PARENT_PROCESSES:
+            syslog.syslog(syslog.LOG_WARNING, f"Askpass called by unauthorized process: {proc_name}")
+            return False
+    except Exception:
+        syslog.syslog(syslog.LOG_WARNING, "Could not determine parent process")
+        return False
+    
+    # 3. Environment verification
+    if not (os.getenv('SSH_AUTH_SOCK') or os.getenv('SSH_TTY') or os.getenv('TERM')):
+        syslog.syslog(syslog.LOG_WARNING, "Askpass called without proper environment")
+        return False
+    
+    # 4. Time-based expiration check
+    if os.path.exists(SSH_ENCRYPTED_FILE):
+        age = time.time() - os.path.getmtime(SSH_ENCRYPTED_FILE)
+        if age > EXPIRATION_HOURS * 3600:
+            syslog.syslog(syslog.LOG_INFO, f"Password expired after {EXPIRATION_HOURS} hours")
+            try:
+                os.remove(SSH_ENCRYPTED_FILE)
+            except:
+                pass
+            return False
+    
+    # 5. User confirmation dialog (if enabled and GUI available)
+    if REQUIRE_USER_CONFIRMATION:
+        if not show_confirmation_dialog():
+            syslog.syslog(syslog.LOG_WARNING, "User denied sudo access via dialog")
+            return False
+        syslog.syslog(syslog.LOG_INFO, "User approved sudo access via dialog")
+    
+    return True
+
+def decrypt_with_ssh_key(encrypted_file):
+    """Decrypt data using SSH private key"""
+    if not os.path.exists(SSH_KEY):
+        return None
+        
+    try:
+        with open(encrypted_file, 'rb') as f:
+            encrypted_data = f.read()
+        
+        # First try direct decryption (for PKCS8 format keys)
+        result = subprocess.run(
+            ['openssl', 'pkeyutl', '-decrypt', '-inkey', SSH_KEY],
+            input=encrypted_data,
+            capture_output=True
+        )
+        
+        if result.returncode == 0:
+            return result.stdout.decode('utf-8').strip()
+        
+        # If that fails, convert key format first
+        temp_pem = '/tmp/ssh_key_pem.tmp'
+        convert_result = subprocess.run(
+            ['openssl', 'rsa', '-in', SSH_KEY, '-out', temp_pem],
+            capture_output=True
+        )
+        
+        if convert_result.returncode == 0:
+            # Try decryption with converted key
+            result = subprocess.run(
+                ['openssl', 'pkeyutl', '-decrypt', '-inkey', temp_pem],
+                input=encrypted_data,
+                capture_output=True
+            )
+            
+            # Clean up temp file
+            os.remove(temp_pem)
+            
+            if result.returncode == 0:
+                return result.stdout.decode('utf-8').strip()
+    
+    except Exception:
+        pass
+    
+    return None
+
+def main():
+    # Initialize syslog
+    syslog.openlog("sudo-askpass")
+    
+    # Perform security checks (including user confirmation)
+    if not check_security():
+        print("Error: Security check failed", file=sys.stderr)
+        syslog.syslog(syslog.LOG_ERR, "Security check failed")
+        sys.exit(1)
+    
+    # Log successful security check
+    try:
+        ppid = os.getppid()
+        proc_name = open(f'/proc/{ppid}/comm').read().strip()
+        command = get_sudo_command()
+        syslog.syslog(syslog.LOG_INFO, f"Askpass approved for {proc_name} (pid {ppid}): {command}")
+    except:
+        syslog.syslog(syslog.LOG_INFO, "Askpass called (process info unavailable)")
+    
+    password = None
+    
+    # Priority 1: SSH encrypted file
+    if os.path.exists(SSH_ENCRYPTED_FILE):
+        password = decrypt_with_ssh_key(SSH_ENCRYPTED_FILE)
+        if password:
+            print(password)
+            syslog.syslog(syslog.LOG_INFO, "Password retrieved via SSH encryption")
+            return
+    
+    # Priority 2: Keyring
+    if HAS_KEYRING and password is None:
+        try:
+            password = keyring.get_password(SERVICE_NAME, USERNAME)
+            if password:
+                print(password)
+                syslog.syslog(syslog.LOG_INFO, "Password retrieved via keyring")
+                return
+        except Exception:
+            pass
+    
+    # No password found
+    print("Error: No password found in secure storage", file=sys.stderr)
+    print("Use 'askpass-manager set' to store the password securely", file=sys.stderr)
+    syslog.syslog(syslog.LOG_ERR, "No password found in secure storage")
+    sys.exit(1)
+
+if __name__ == "__main__":
+    main()

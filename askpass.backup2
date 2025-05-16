@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""
+Askpass helper that retrieves passwords using secure methods only
+Enhanced with additional security measures
+"""
+
+import sys
+import os
+import subprocess
+import time
+import syslog
+
+# Try keyring as backup
+try:
+    import keyring
+    HAS_KEYRING = True
+except ImportError:
+    HAS_KEYRING = False
+
+SERVICE_NAME = "sudo-askpass"
+USERNAME = "sudo"
+SSH_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.ssh")
+SSH_KEY = os.path.expanduser("~/.ssh/id_rsa")
+
+# Security configurations
+ALLOWED_PATHS = ['/home/ian/', '/tmp/']  # Directories where askpass can be called from
+EXPIRATION_HOURS = 24  # Password expiration time in hours
+ALLOWED_PARENT_PROCESSES = ['sudo', 'claude-code', 'code', 'bash', 'sh']
+
+def check_security():
+    """Perform security checks before retrieving password"""
+    # 1. Path-based restriction
+    cwd = os.getcwd()
+    if not any(cwd.startswith(path) for path in ALLOWED_PATHS):
+        syslog.syslog(syslog.LOG_WARNING, f"Askpass called from unauthorized path: {cwd}")
+        return False
+    
+    # 2. Process validation
+    try:
+        ppid = os.getppid()
+        proc_name = open(f'/proc/{ppid}/comm').read().strip()
+        if proc_name not in ALLOWED_PARENT_PROCESSES:
+            syslog.syslog(syslog.LOG_WARNING, f"Askpass called by unauthorized process: {proc_name}")
+            return False
+    except Exception:
+        # If we can't determine parent process, fail safely
+        syslog.syslog(syslog.LOG_WARNING, "Could not determine parent process")
+        return False
+    
+    # 3. Environment verification - require SSH session or terminal
+    if not (os.getenv('SSH_AUTH_SOCK') or os.getenv('SSH_TTY') or os.getenv('TERM')):
+        syslog.syslog(syslog.LOG_WARNING, "Askpass called without proper environment")
+        return False
+    
+    # 4. Time-based expiration check
+    if os.path.exists(SSH_ENCRYPTED_FILE):
+        age = time.time() - os.path.getmtime(SSH_ENCRYPTED_FILE)
+        if age > EXPIRATION_HOURS * 3600:
+            syslog.syslog(syslog.LOG_INFO, f"Password expired after {EXPIRATION_HOURS} hours")
+            try:
+                os.remove(SSH_ENCRYPTED_FILE)
+            except:
+                pass
+            return False
+    
+    return True
+
+def decrypt_with_ssh_key(encrypted_file):
+    """Decrypt data using SSH private key"""
+    if not os.path.exists(SSH_KEY):
+        return None
+        
+    try:
+        with open(encrypted_file, 'rb') as f:
+            encrypted_data = f.read()
+        
+        # First try direct decryption (for PKCS8 format keys)
+        result = subprocess.run(
+            ['openssl', 'pkeyutl', '-decrypt', '-inkey', SSH_KEY],
+            input=encrypted_data,
+            capture_output=True
+        )
+        
+        if result.returncode == 0:
+            return result.stdout.decode('utf-8').strip()
+        
+        # If that fails, convert key format first
+        temp_pem = '/tmp/ssh_key_pem.tmp'
+        convert_result = subprocess.run(
+            ['openssl', 'rsa', '-in', SSH_KEY, '-out', temp_pem],
+            capture_output=True
+        )
+        
+        if convert_result.returncode == 0:
+            # Try decryption with converted key
+            result = subprocess.run(
+                ['openssl', 'pkeyutl', '-decrypt', '-inkey', temp_pem],
+                input=encrypted_data,
+                capture_output=True
+            )
+            
+            # Clean up temp file
+            os.remove(temp_pem)
+            
+            if result.returncode == 0:
+                return result.stdout.decode('utf-8').strip()
+    
+    except Exception:
+        pass
+    
+    return None
+
+def main():
+    # Initialize syslog
+    syslog.openlog("sudo-askpass")
+    
+    # Perform security checks
+    if not check_security():
+        print("Error: Security check failed", file=sys.stderr)
+        syslog.syslog(syslog.LOG_ERR, "Security check failed")
+        sys.exit(1)
+    
+    # Log successful security check
+    try:
+        ppid = os.getppid()
+        proc_name = open(f'/proc/{ppid}/comm').read().strip()
+        syslog.syslog(syslog.LOG_INFO, f"Askpass called by {proc_name} (pid {ppid}) from {os.getcwd()}")
+    except:
+        syslog.syslog(syslog.LOG_INFO, "Askpass called (process info unavailable)")
+    
+    password = None
+    
+    # Priority 1: SSH encrypted file
+    if os.path.exists(SSH_ENCRYPTED_FILE):
+        password = decrypt_with_ssh_key(SSH_ENCRYPTED_FILE)
+        if password:
+            print(password)
+            syslog.syslog(syslog.LOG_INFO, "Password retrieved via SSH encryption")
+            return
+    
+    # Priority 2: Keyring
+    if HAS_KEYRING and password is None:
+        try:
+            password = keyring.get_password(SERVICE_NAME, USERNAME)
+            if password:
+                print(password)
+                syslog.syslog(syslog.LOG_INFO, "Password retrieved via keyring")
+                return
+        except Exception:
+            pass
+    
+    # No insecure fallbacks - require secure storage
+    
+    # No password found
+    print("Error: No password found in secure storage", file=sys.stderr)
+    print("Use 'askpass-manager set' to store the password securely", file=sys.stderr)
+    print("Secure storage methods: SSH encryption or system keyring", file=sys.stderr)
+    syslog.syslog(syslog.LOG_ERR, "No password found in secure storage")
+    sys.exit(1)
+
+if __name__ == "__main__":
+    main()
