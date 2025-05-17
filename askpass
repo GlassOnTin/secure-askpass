@@ -9,6 +9,7 @@ import subprocess
 import time
 import syslog
 import socket
+import tempfile
 
 # GUI imports
 try:
@@ -39,13 +40,16 @@ USERNAME = "sudo"
 SSH_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.ssh")
 SSH_KEY = os.path.expanduser("~/.ssh/id_rsa")
 CONFIG_FILE = os.path.expanduser("~/.config/secure-askpass/config.json")
+RATE_LIMIT_FILE = os.path.expanduser("~/.config/secure-askpass/rate_limit.json")
 
 # Default security configurations
 DEFAULT_CONFIG = {
     "require_user_confirmation": True,
     "allowed_paths": ["/home/ian/", "/tmp/"],
     "expiration_hours": 24,
-    "allowed_processes": ["sudo", "claude-code", "code", "bash", "sh"]
+    "allowed_processes": ["sudo", "claude-code", "code", "bash", "sh"],
+    "max_attempts_per_hour": 30,
+    "lockout_minutes": 15
 }
 
 # Load configuration
@@ -80,6 +84,70 @@ ALLOWED_PATHS = config['allowed_paths']
 EXPIRATION_HOURS = config['expiration_hours']
 ALLOWED_PARENT_PROCESSES = config['allowed_processes']
 REQUIRE_USER_CONFIRMATION = config['require_user_confirmation']
+MAX_ATTEMPTS_PER_HOUR = config['max_attempts_per_hour']
+LOCKOUT_MINUTES = config['lockout_minutes']
+
+def check_rate_limit():
+    """Check if rate limit has been exceeded"""
+    import json
+    from datetime import datetime, timedelta
+    
+    try:
+        # Load rate limit data
+        if os.path.exists(RATE_LIMIT_FILE):
+            with open(RATE_LIMIT_FILE, 'r') as f:
+                rate_data = json.load(f)
+        else:
+            rate_data = {"attempts": [], "lockout_until": None}
+        
+        now = datetime.now()
+        
+        # Check if locked out
+        if rate_data.get("lockout_until"):
+            lockout_until = datetime.fromisoformat(rate_data["lockout_until"])
+            if now < lockout_until:
+                remaining = int((lockout_until - now).total_seconds() / 60)
+                syslog.syslog(syslog.LOG_WARNING, f"Rate limit lockout in effect for {remaining} more minutes")
+                return False
+            else:
+                # Lockout expired
+                rate_data["lockout_until"] = None
+        
+        # Clean old attempts (older than 1 hour)
+        one_hour_ago = now - timedelta(hours=1)
+        rate_data["attempts"] = [
+            attempt for attempt in rate_data["attempts"]
+            if datetime.fromisoformat(attempt) > one_hour_ago
+        ]
+        
+        # Check attempt count
+        if len(rate_data["attempts"]) >= MAX_ATTEMPTS_PER_HOUR:
+            # Apply lockout
+            lockout_until = now + timedelta(minutes=LOCKOUT_MINUTES)
+            rate_data["lockout_until"] = lockout_until.isoformat()
+            syslog.syslog(syslog.LOG_WARNING, f"Rate limit exceeded, locking out for {LOCKOUT_MINUTES} minutes")
+            
+            # Save rate limit data
+            os.makedirs(os.path.dirname(RATE_LIMIT_FILE), exist_ok=True)
+            with open(RATE_LIMIT_FILE, 'w') as f:
+                json.dump(rate_data, f)
+            
+            return False
+        
+        # Record this attempt
+        rate_data["attempts"].append(now.isoformat())
+        
+        # Save rate limit data
+        os.makedirs(os.path.dirname(RATE_LIMIT_FILE), exist_ok=True)
+        with open(RATE_LIMIT_FILE, 'w') as f:
+            json.dump(rate_data, f)
+        
+        return True
+        
+    except Exception as e:
+        syslog.syslog(syslog.LOG_ERR, f"Rate limit check failed: {e}")
+        # Fail open to avoid lockout due to errors
+        return True
 
 def get_sudo_command():
     """Try to determine what command sudo is trying to run"""
@@ -179,6 +247,10 @@ def show_confirmation_dialog():
 
 def check_security():
     """Perform security checks before retrieving password"""
+    # 0. Rate limit check
+    if not check_rate_limit():
+        return False
+    
     # 1. Path-based restriction
     cwd = os.getcwd()
     if not any(cwd.startswith(path) for path in ALLOWED_PATHS):
@@ -240,26 +312,34 @@ def decrypt_with_ssh_key(encrypted_file):
         if result.returncode == 0:
             return result.stdout.decode('utf-8').strip()
         
-        # If that fails, convert key format first
-        temp_pem = '/tmp/ssh_key_pem.tmp'
-        convert_result = subprocess.run(
-            ['openssl', 'rsa', '-in', SSH_KEY, '-out', temp_pem],
-            capture_output=True
-        )
+        # If that fails, convert key format first using secure temp file
+        # Security fix: Use tempfile.NamedTemporaryFile to avoid predictable paths
+        # and set restrictive permissions immediately to prevent race conditions
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as temp_file:
+            temp_pem = temp_file.name
+            # Set restrictive permissions immediately
+            os.chmod(temp_pem, 0o600)
         
-        if convert_result.returncode == 0:
-            # Try decryption with converted key
-            result = subprocess.run(
-                ['openssl', 'pkeyutl', '-decrypt', '-inkey', temp_pem],
-                input=encrypted_data,
+        try:
+            convert_result = subprocess.run(
+                ['openssl', 'rsa', '-in', SSH_KEY, '-out', temp_pem],
                 capture_output=True
             )
             
-            # Clean up temp file
-            os.remove(temp_pem)
-            
-            if result.returncode == 0:
-                return result.stdout.decode('utf-8').strip()
+            if convert_result.returncode == 0:
+                # Try decryption with converted key
+                result = subprocess.run(
+                    ['openssl', 'pkeyutl', '-decrypt', '-inkey', temp_pem],
+                    input=encrypted_data,
+                    capture_output=True
+                )
+                
+                if result.returncode == 0:
+                    return result.stdout.decode('utf-8').strip()
+        finally:
+            # Always clean up temp file
+            if os.path.exists(temp_pem):
+                os.remove(temp_pem)
     
     except Exception:
         pass
