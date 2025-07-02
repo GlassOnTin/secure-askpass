@@ -5,7 +5,7 @@ A secure askpass implementation using SSH key encryption for non-interactive sud
 ## Installation
 
 1. Clone this repository
-2. Ensure you have SSH keys (`~/.ssh/id_rsa`)
+2. Ensure you have SSH keys (supports ed25519, ecdsa, rsa, or dsa)
 3. Set the `SUDO_ASKPASS` environment variable in your shell configuration:
    ```bash
    export SUDO_ASKPASS="/path/to/secure-askpass/askpass"
@@ -30,6 +30,8 @@ Or use the test command:
 ## Security
 
 - Passwords are encrypted with your SSH public key
+- Supports multiple SSH key types (ed25519, ecdsa, rsa, dsa) with automatic detection
+- Keys are checked in order of preference: ed25519 > ecdsa > rsa > dsa
 - Stored in `~/.sudo_askpass.ssh` with 600 permissions
 - Falls back to system keyring if available
 - Refuses plain text storage

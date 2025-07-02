@@ -38,10 +38,27 @@ except ImportError:
 SERVICE_NAME = "sudo-askpass"
 USERNAME = "sudo"
 SSH_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.ssh")
-SSH_KEY = os.path.expanduser("~/.ssh/id_rsa")
 CONFIG_FILE = os.path.expanduser("~/.config/secure-askpass/config.json")
 RATE_LIMIT_FILE = os.path.expanduser("~/.config/secure-askpass/rate_limit.json")
 AUDIT_LOG_FILE = os.path.expanduser("~/.config/secure-askpass/audit.log")
+
+# SSH key types to try in order of preference
+SSH_KEY_TYPES = [
+    ("~/.ssh/id_ed25519", "Ed25519"),
+    ("~/.ssh/id_ecdsa", "ECDSA"),
+    ("~/.ssh/id_rsa", "RSA"),
+    ("~/.ssh/id_dsa", "DSA")
+]
+
+def find_ssh_key():
+    """Find the first available SSH private key"""
+    for key_path, key_type in SSH_KEY_TYPES:
+        full_path = os.path.expanduser(key_path)
+        if os.path.exists(full_path):
+            return full_path, key_type
+    return None, None
+
+SSH_KEY, SSH_KEY_TYPE = find_ssh_key()
 
 # Default security configurations
 DEFAULT_CONFIG = {
@@ -296,7 +313,7 @@ def check_security():
 
 def decrypt_with_ssh_key(encrypted_file):
     """Decrypt data using SSH private key"""
-    if not os.path.exists(SSH_KEY):
+    if not SSH_KEY or not os.path.exists(SSH_KEY):
         return None
         
     try:
@@ -322,10 +339,22 @@ def decrypt_with_ssh_key(encrypted_file):
             os.chmod(temp_pem, 0o600)
         
         try:
-            convert_result = subprocess.run(
-                ['openssl', 'rsa', '-in', SSH_KEY, '-out', temp_pem],
-                capture_output=True
-            )
+            # Use appropriate conversion command based on key type
+            if SSH_KEY_TYPE == "RSA":
+                convert_cmd = ['openssl', 'rsa', '-in', SSH_KEY, '-out', temp_pem]
+            elif SSH_KEY_TYPE == "DSA":
+                convert_cmd = ['openssl', 'dsa', '-in', SSH_KEY, '-out', temp_pem]
+            elif SSH_KEY_TYPE == "ECDSA":
+                convert_cmd = ['openssl', 'ec', '-in', SSH_KEY, '-out', temp_pem]
+            elif SSH_KEY_TYPE == "Ed25519":
+                # Ed25519 keys are typically in PKCS8 format already
+                # Try converting from OpenSSH format to PKCS8 PEM
+                convert_cmd = ['openssl', 'pkey', '-in', SSH_KEY, '-out', temp_pem]
+            else:
+                # Generic attempt
+                convert_cmd = ['openssl', 'pkey', '-in', SSH_KEY, '-out', temp_pem]
+            
+            convert_result = subprocess.run(convert_cmd, capture_output=True)
             
             if convert_result.returncode == 0:
                 # Try decryption with converted key
@@ -426,7 +455,8 @@ def main():
         password = decrypt_with_ssh_key(SSH_ENCRYPTED_FILE)
         if password:
             print(password)
-            syslog.syslog(syslog.LOG_INFO, "Password retrieved via SSH encryption")
+            key_info = f" ({SSH_KEY_TYPE} key)" if SSH_KEY_TYPE else ""
+            syslog.syslog(syslog.LOG_INFO, f"Password retrieved via SSH encryption{key_info}")
             # Clear password from memory
             password = secure_memory_clear(password)
             return

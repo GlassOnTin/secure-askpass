@@ -18,11 +18,31 @@ except ImportError:
 SERVICE_NAME = "sudo-askpass"
 USERNAME = "sudo"
 SSH_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.ssh")
-SSH_KEY = os.path.expanduser("~/.ssh/id_rsa")
-SSH_PUB = os.path.expanduser("~/.ssh/id_rsa.pub")
+
+# SSH key types to try in order of preference
+SSH_KEY_TYPES = [
+    ("~/.ssh/id_ed25519", "~/.ssh/id_ed25519.pub", "Ed25519"),
+    ("~/.ssh/id_ecdsa", "~/.ssh/id_ecdsa.pub", "ECDSA"),
+    ("~/.ssh/id_rsa", "~/.ssh/id_rsa.pub", "RSA"),
+    ("~/.ssh/id_dsa", "~/.ssh/id_dsa.pub", "DSA")
+]
+
+def find_ssh_keypair():
+    """Find the first available SSH keypair"""
+    for priv_path, pub_path, key_type in SSH_KEY_TYPES:
+        priv_full = os.path.expanduser(priv_path)
+        pub_full = os.path.expanduser(pub_path)
+        if os.path.exists(priv_full) and os.path.exists(pub_full):
+            return priv_full, pub_full, key_type
+    return None, None, None
+
+SSH_KEY, SSH_PUB, SSH_KEY_TYPE = find_ssh_keypair()
 
 def extract_pubkey_for_openssl():
     """Convert SSH public key to OpenSSL format"""
+    if not SSH_PUB:
+        return None
+        
     try:
         # First extract the public key in PEM format
         result = subprocess.run(
@@ -32,10 +52,13 @@ def extract_pubkey_for_openssl():
         )
         
         if result.returncode == 0:
-            # Save to temporary file
-            temp_pem = '/tmp/ssh_pubkey.pem'
-            with open(temp_pem, 'w') as f:
-                f.write(result.stdout)
+            # Use secure temp file instead of predictable path
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as temp_file:
+                temp_pem = temp_file.name
+                temp_file.write(result.stdout)
+            # Set restrictive permissions
+            os.chmod(temp_pem, 0o600)
             return temp_pem
         
     except Exception:
@@ -162,8 +185,8 @@ def set_password():
                 temp[i] = 0
     
     # Priority 1: Try SSH encryption
-    if os.path.exists(SSH_KEY) and os.path.exists(SSH_PUB):
-        print("Using SSH key encryption...")
+    if SSH_KEY and SSH_PUB:
+        print(f"Using SSH key encryption ({SSH_KEY_TYPE} key)...")
         encrypted = encrypt_with_ssh_key(password)
         
         if encrypted:
@@ -171,7 +194,7 @@ def set_password():
                 with open(SSH_ENCRYPTED_FILE, 'wb') as f:
                     f.write(encrypted)
                 os.chmod(SSH_ENCRYPTED_FILE, 0o600)
-                print(f"Password encrypted with SSH key and stored in {SSH_ENCRYPTED_FILE}")
+                print(f"Password encrypted with {SSH_KEY_TYPE} key and stored in {SSH_ENCRYPTED_FILE}")
                 # Clear sensitive data from memory
                 secure_clear(password)
                 secure_clear(confirm)
@@ -193,7 +216,7 @@ def set_password():
     # No more insecure fallbacks
     print("Error: Unable to store password securely", file=sys.stderr)
     print("Please ensure you have either:")
-    print("  - SSH keys (~/.ssh/id_rsa) for encryption")
+    print("  - SSH keys (ed25519, ecdsa, rsa, or dsa) for encryption")
     print("  - A working keyring system")
     return False
 
@@ -334,7 +357,7 @@ def main():
         print("  audit - Show recent askpass usage")
         print()
         print("Storage methods (secure only):")
-        print("  1. SSH key encryption (default if SSH keys exist)")
+        print("  1. SSH key encryption (supports ed25519, ecdsa, rsa, dsa)")
         print("  2. System keyring")
         sys.exit(1)
     
