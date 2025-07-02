@@ -69,13 +69,85 @@ def encrypt_with_ssh_key(password):
     
     return None
 
+def get_password_via_gui():
+    """Get password using GUI dialog if available, otherwise fallback to terminal"""
+    password = None
+    confirm = None
+    
+    # Try kdialog first (KDE)
+    try:
+        result = subprocess.run(
+            ['kdialog', '--password', 'Enter sudo password to store:'],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            password = result.stdout.strip()
+            # Get confirmation
+            result = subprocess.run(
+                ['kdialog', '--password', 'Confirm password:'],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                confirm = result.stdout.strip()
+                return password, confirm
+    except FileNotFoundError:
+        pass
+    
+    # Try zenity (GNOME/Ubuntu)
+    try:
+        result = subprocess.run(
+            ['zenity', '--password', '--title=Askpass Manager'],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            password = result.stdout.strip()
+            # Get confirmation
+            result = subprocess.run(
+                ['zenity', '--password', '--title=Askpass Manager - Confirm'],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                confirm = result.stdout.strip()
+                return password, confirm
+    except FileNotFoundError:
+        pass
+    
+    # Try tkinter if available
+    try:
+        import tkinter as tk
+        from tkinter import simpledialog
+        
+        root = tk.Tk()
+        root.withdraw()  # Hide the main window
+        
+        password = simpledialog.askstring("Askpass Manager", "Enter sudo password to store:", show='*')
+        if password:
+            confirm = simpledialog.askstring("Askpass Manager", "Confirm password:", show='*')
+        
+        root.destroy()
+        return password, confirm
+    except ImportError:
+        pass
+    
+    # Fallback to terminal
+    password = getpass.getpass("Enter sudo password to store: ")
+    confirm = getpass.getpass("Confirm password: ")
+    return password, confirm
+
 def set_password():
     """Store password encrypted with SSH key (primary) or other fallbacks"""
     print("Storing your sudo password...")
     
-    # Get password
-    password = getpass.getpass("Enter sudo password to store: ")
-    confirm = getpass.getpass("Confirm password: ")
+    # Get password via GUI or terminal
+    password, confirm = get_password_via_gui()
+    
+    if not password or not confirm:
+        print("Error: Password entry cancelled", file=sys.stderr)
+        return False
     
     if password != confirm:
         print("Error: Passwords don't match", file=sys.stderr)
