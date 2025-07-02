@@ -153,6 +153,14 @@ def set_password():
         print("Error: Passwords don't match", file=sys.stderr)
         return False
     
+    # Clear passwords from memory after use
+    def secure_clear(data):
+        if data:
+            # Overwrite with zeros
+            temp = bytearray(data, 'utf-8')
+            for i in range(len(temp)):
+                temp[i] = 0
+    
     # Priority 1: Try SSH encryption
     if os.path.exists(SSH_KEY) and os.path.exists(SSH_PUB):
         print("Using SSH key encryption...")
@@ -164,6 +172,9 @@ def set_password():
                     f.write(encrypted)
                 os.chmod(SSH_ENCRYPTED_FILE, 0o600)
                 print(f"Password encrypted with SSH key and stored in {SSH_ENCRYPTED_FILE}")
+                # Clear sensitive data from memory
+                secure_clear(password)
+                secure_clear(confirm)
                 return True
             except Exception as e:
                 print(f"Error saving SSH encrypted file: {e}")
@@ -275,15 +286,52 @@ def test_sudo():
         print("Test failed:", result.stderr.strip(), file=sys.stderr)
         return False
 
+def show_audit_log():
+    """Display recent audit log entries"""
+    audit_file = os.path.expanduser("~/.config/secure-askpass/audit.log")
+    
+    if not os.path.exists(audit_file):
+        print("No audit log found")
+        return True
+    
+    try:
+        import json
+        from datetime import datetime, timedelta
+        
+        # Read last 50 entries
+        with open(audit_file, 'r') as f:
+            lines = f.readlines()[-50:]
+        
+        print(f"\nRecent askpass usage (last {len(lines)} entries):")
+        print("-" * 80)
+        
+        for line in lines:
+            try:
+                entry = json.loads(line.strip())
+                timestamp = datetime.fromisoformat(entry['timestamp'])
+                print(f"{timestamp.strftime('%Y-%m-%d %H:%M:%S')} | "
+                      f"User: {entry['user']} | "
+                      f"Process: {entry['process']} | "
+                      f"Command: {entry['command'][:50]}...")
+            except:
+                pass
+        
+        print("-" * 80)
+        return True
+    except Exception as e:
+        print(f"Error reading audit log: {e}")
+        return False
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: askpass-manager [set|get|clear|test]")
+        print("Usage: askpass-manager [set|get|clear|test|audit]")
         print()
         print("Commands:")
         print("  set   - Store password (SSH encryption by default)")
         print("  get   - Check if password exists")
         print("  clear - Remove stored password")
         print("  test  - Test sudo with askpass")
+        print("  audit - Show recent askpass usage")
         print()
         print("Storage methods (secure only):")
         print("  1. SSH key encryption (default if SSH keys exist)")
@@ -300,6 +348,8 @@ def main():
         success = clear_password()
     elif command == "test":
         success = test_sudo()
+    elif command == "audit":
+        success = show_audit_log()
     else:
         print(f"Unknown command: {command}", file=sys.stderr)
         success = False

@@ -41,6 +41,7 @@ SSH_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.ssh")
 SSH_KEY = os.path.expanduser("~/.ssh/id_rsa")
 CONFIG_FILE = os.path.expanduser("~/.config/secure-askpass/config.json")
 RATE_LIMIT_FILE = os.path.expanduser("~/.config/secure-askpass/rate_limit.json")
+AUDIT_LOG_FILE = os.path.expanduser("~/.config/secure-askpass/audit.log")
 
 # Default security configurations
 DEFAULT_CONFIG = {
@@ -346,9 +347,45 @@ def decrypt_with_ssh_key(encrypted_file):
     
     return None
 
+def validate_environment():
+    """Validate SUDO_ASKPASS environment variable to prevent hijacking"""
+    askpass_path = os.environ.get('SUDO_ASKPASS', '')
+    if not askpass_path:
+        return True  # Not using askpass
+    
+    # Get the real path of this script
+    this_script = os.path.realpath(os.path.abspath(__file__))
+    provided_script = os.path.realpath(os.path.abspath(askpass_path))
+    
+    if this_script != provided_script:
+        syslog.syslog(syslog.LOG_CRIT, f"SUDO_ASKPASS hijacking detected! Expected: {this_script}, Got: {provided_script}")
+        return False
+    
+    # Check file permissions (should not be writable by others)
+    stats = os.stat(this_script)
+    if stats.st_mode & 0o022:  # Check for group/other write permissions
+        syslog.syslog(syslog.LOG_CRIT, f"SUDO_ASKPASS script has insecure permissions: {oct(stats.st_mode)}")
+        return False
+    
+    return True
+
+def secure_memory_clear(data):
+    """Attempt to clear sensitive data from memory"""
+    if isinstance(data, str):
+        # Convert to mutable bytearray to overwrite
+        as_bytes = bytearray(data, 'utf-8')
+        for i in range(len(as_bytes)):
+            as_bytes[i] = 0
+    return None
+
 def main():
     # Initialize syslog
     syslog.openlog("sudo-askpass")
+    
+    # Validate environment to prevent hijacking
+    if not validate_environment():
+        print("Error: Environment validation failed", file=sys.stderr)
+        sys.exit(1)
     
     # Perform security checks (including user confirmation)
     if not check_security():
@@ -362,6 +399,23 @@ def main():
         proc_name = open(f'/proc/{ppid}/comm').read().strip()
         command = get_sudo_command()
         syslog.syslog(syslog.LOG_INFO, f"Askpass approved for {proc_name} (pid {ppid}): {command}")
+        
+        # Write to audit log
+        from datetime import datetime
+        audit_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "pid": ppid,
+            "process": proc_name,
+            "command": command,
+            "user": os.environ.get('USER', 'unknown'),
+            "cwd": os.getcwd(),
+            "status": "approved"
+        }
+        
+        os.makedirs(os.path.dirname(AUDIT_LOG_FILE), exist_ok=True)
+        with open(AUDIT_LOG_FILE, 'a') as f:
+            import json
+            f.write(json.dumps(audit_entry) + '\n')
     except:
         syslog.syslog(syslog.LOG_INFO, "Askpass called (process info unavailable)")
     
@@ -373,6 +427,8 @@ def main():
         if password:
             print(password)
             syslog.syslog(syslog.LOG_INFO, "Password retrieved via SSH encryption")
+            # Clear password from memory
+            password = secure_memory_clear(password)
             return
     
     # Priority 2: Keyring
@@ -382,6 +438,8 @@ def main():
             if password:
                 print(password)
                 syslog.syslog(syslog.LOG_INFO, "Password retrieved via keyring")
+                # Clear password from memory
+                password = secure_memory_clear(password)
                 return
         except Exception:
             pass
