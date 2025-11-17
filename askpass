@@ -38,6 +38,7 @@ except ImportError:
 SERVICE_NAME = "sudo-askpass"
 USERNAME = "sudo"
 SSH_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.ssh")
+AGE_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.age")
 CONFIG_FILE = os.path.expanduser("~/.config/secure-askpass/config.json")
 RATE_LIMIT_FILE = os.path.expanduser("~/.config/secure-askpass/rate_limit.json")
 AUDIT_LOG_FILE = os.path.expanduser("~/.config/secure-askpass/audit.log")
@@ -49,6 +50,16 @@ SSH_KEY_TYPES = [
     ("~/.ssh/id_rsa", "RSA"),
     ("~/.ssh/id_dsa", "DSA")
 ]
+
+def check_age_available():
+    """Check if age encryption tool is available"""
+    try:
+        result = subprocess.run(['age', '--version'], capture_output=True)
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+HAS_AGE = check_age_available()
 
 def find_ssh_key():
     """Find the first available SSH private key"""
@@ -311,11 +322,35 @@ def check_security():
     
     return True
 
+def decrypt_with_age(encrypted_file):
+    """Decrypt data using age with SSH private key"""
+    if not HAS_AGE or not SSH_KEY or not os.path.exists(SSH_KEY):
+        return None
+
+    try:
+        with open(encrypted_file, 'rb') as f:
+            encrypted_data = f.read()
+
+        # Use age with SSH private key identity
+        result = subprocess.run(
+            ['age', '-d', '-i', SSH_KEY],
+            input=encrypted_data,
+            capture_output=True
+        )
+
+        if result.returncode == 0:
+            return result.stdout.decode('utf-8').strip()
+
+    except Exception:
+        pass
+
+    return None
+
 def decrypt_with_ssh_key(encrypted_file):
     """Decrypt data using SSH private key"""
     if not SSH_KEY or not os.path.exists(SSH_KEY):
         return None
-        
+
     try:
         with open(encrypted_file, 'rb') as f:
             encrypted_data = f.read()
@@ -449,8 +484,19 @@ def main():
         syslog.syslog(syslog.LOG_INFO, "Askpass called (process info unavailable)")
     
     password = None
-    
-    # Priority 1: SSH encrypted file
+
+    # Priority 1: Age encrypted file (for Ed25519 keys)
+    if os.path.exists(AGE_ENCRYPTED_FILE):
+        password = decrypt_with_age(AGE_ENCRYPTED_FILE)
+        if password:
+            print(password)
+            key_info = f" ({SSH_KEY_TYPE} key)" if SSH_KEY_TYPE else ""
+            syslog.syslog(syslog.LOG_INFO, f"Password retrieved via age encryption{key_info}")
+            # Clear password from memory
+            password = secure_memory_clear(password)
+            return
+
+    # Priority 2: SSH encrypted file (for RSA/ECDSA/DSA keys)
     if os.path.exists(SSH_ENCRYPTED_FILE):
         password = decrypt_with_ssh_key(SSH_ENCRYPTED_FILE)
         if password:
@@ -461,7 +507,7 @@ def main():
             password = secure_memory_clear(password)
             return
     
-    # Priority 2: Keyring
+    # Priority 3: Keyring
     if HAS_KEYRING and password is None:
         try:
             password = keyring.get_password(SERVICE_NAME, USERNAME)
