@@ -322,9 +322,115 @@ def check_security():
     
     return True
 
+def ensure_ssh_key_loaded():
+    """Ensure SSH key is loaded in ssh-agent, prompt for passphrase if needed"""
+    if not SSH_KEY or not os.path.exists(SSH_KEY):
+        return False
+
+    try:
+        # Check if ssh-agent is running
+        if not os.environ.get('SSH_AUTH_SOCK'):
+            # Start ssh-agent
+            result = subprocess.run(['ssh-agent', '-s'], capture_output=True, text=True)
+            if result.returncode == 0:
+                # Parse and set environment variables
+                for line in result.stdout.split('\n'):
+                    if '=' in line and 'echo' not in line:
+                        key, value = line.split(';')[0].split('=', 1)
+                        os.environ[key.strip()] = value.strip().strip('"').strip("'")
+
+        # Check if key is already loaded
+        check_result = subprocess.run(['ssh-add', '-l'], capture_output=True)
+        if check_result.returncode == 0:
+            # Check if our specific key is loaded
+            key_fingerprint = subprocess.run(
+                ['ssh-keygen', '-lf', SSH_KEY],
+                capture_output=True,
+                text=True
+            )
+            if key_fingerprint.returncode == 0:
+                fingerprint = key_fingerprint.stdout.split()[1]
+                if fingerprint in check_result.stdout.decode():
+                    return True
+
+        # Key not loaded, prompt for passphrase
+        passphrase = prompt_ssh_passphrase()
+        if not passphrase:
+            return False
+
+        # Add key to ssh-agent with passphrase
+        add_result = subprocess.run(
+            ['ssh-add', SSH_KEY],
+            input=passphrase.encode(),
+            capture_output=True
+        )
+
+        # Clear passphrase from memory
+        passphrase = None
+
+        return add_result.returncode == 0
+
+    except Exception as e:
+        syslog.syslog(syslog.LOG_ERR, f"Failed to ensure SSH key loaded: {e}")
+        return False
+
+def prompt_ssh_passphrase():
+    """Prompt for SSH key passphrase using GUI"""
+    # Try Tkinter first
+    if HAS_GUI and 'DISPLAY' in os.environ:
+        try:
+            import tkinter.simpledialog as simpledialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+
+            passphrase = simpledialog.askstring(
+                "SSH Key Passphrase Required",
+                f"Enter passphrase for {SSH_KEY}:",
+                show='*'
+            )
+            root.destroy()
+            return passphrase
+        except Exception:
+            pass
+
+    # Try zenity
+    if 'DISPLAY' in os.environ:
+        try:
+            result = subprocess.run(
+                ['zenity', '--password', '--title=SSH Key Passphrase Required',
+                 f'--text=Enter passphrase for {SSH_KEY}:'],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except FileNotFoundError:
+            pass
+
+    # Try kdialog
+    if 'DISPLAY' in os.environ:
+        try:
+            result = subprocess.run(
+                ['kdialog', '--password', f'Enter passphrase for {SSH_KEY}:'],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except FileNotFoundError:
+            pass
+
+    return None
+
 def decrypt_with_age(encrypted_file):
     """Decrypt data using age with SSH private key"""
     if not HAS_AGE or not SSH_KEY or not os.path.exists(SSH_KEY):
+        return None
+
+    # Ensure SSH key is loaded in ssh-agent
+    if not ensure_ssh_key_loaded():
+        syslog.syslog(syslog.LOG_ERR, "Failed to load SSH key into ssh-agent")
         return None
 
     try:

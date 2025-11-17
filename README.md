@@ -49,6 +49,16 @@ Or use the test command:
 
 Ed25519 is a signing algorithm (EdDSA), not an encryption algorithm. While OpenSSL can handle RSA encryption directly, Ed25519 keys cannot be used for asymmetric encryption. The `age` tool was specifically designed to work with SSH keys including Ed25519, providing a secure and modern encryption solution.
 
+### Automatic SSH Key Management
+
+If your SSH key is password-protected (recommended!), the askpass tool will:
+1. Automatically start ssh-agent if not running
+2. Check if your SSH key is loaded
+3. Prompt for your SSH key passphrase via GUI dialog if needed
+4. Load the key into ssh-agent for the session
+
+**Workflow:** You only enter your SSH key passphrase once per session (via GUI), then sudo commands only require the confirmation dialog. No terminal interaction needed!
+
 ## Commands
 
 ```bash
