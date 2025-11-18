@@ -18,6 +18,7 @@ except ImportError:
 SERVICE_NAME = "sudo-askpass"
 USERNAME = "sudo"
 SSH_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.ssh")
+AGE_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.age")
 
 # SSH key types to try in order of preference
 SSH_KEY_TYPES = [
@@ -26,6 +27,16 @@ SSH_KEY_TYPES = [
     ("~/.ssh/id_rsa", "~/.ssh/id_rsa.pub", "RSA"),
     ("~/.ssh/id_dsa", "~/.ssh/id_dsa.pub", "DSA")
 ]
+
+def check_age_available():
+    """Check if age encryption tool is available"""
+    try:
+        result = subprocess.run(['age', '--version'], capture_output=True)
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+HAS_AGE = check_age_available()
 
 def find_ssh_keypair():
     """Find the first available SSH keypair"""
@@ -38,11 +49,32 @@ def find_ssh_keypair():
 
 SSH_KEY, SSH_PUB, SSH_KEY_TYPE = find_ssh_keypair()
 
+def encrypt_with_age(password):
+    """Encrypt password with age using SSH public key"""
+    if not HAS_AGE or not SSH_PUB:
+        return None
+
+    try:
+        # Use age with SSH public key
+        result = subprocess.run(
+            ['age', '-R', SSH_PUB, '-a'],
+            input=password.encode(),
+            capture_output=True
+        )
+
+        if result.returncode == 0:
+            return result.stdout
+
+    except Exception:
+        pass
+
+    return None
+
 def extract_pubkey_for_openssl():
     """Convert SSH public key to OpenSSL format"""
     if not SSH_PUB:
         return None
-        
+
     try:
         # First extract the public key in PEM format
         result = subprocess.run(
@@ -50,7 +82,7 @@ def extract_pubkey_for_openssl():
             capture_output=True,
             text=True
         )
-        
+
         if result.returncode == 0:
             # Use secure temp file instead of predictable path
             import tempfile
@@ -60,10 +92,10 @@ def extract_pubkey_for_openssl():
             # Set restrictive permissions
             os.chmod(temp_pem, 0o600)
             return temp_pem
-        
+
     except Exception:
         pass
-    
+
     return None
 
 def encrypt_with_ssh_key(password):
@@ -187,20 +219,48 @@ def set_password():
     # Priority 1: Try SSH encryption
     if SSH_KEY and SSH_PUB:
         print(f"Using SSH key encryption ({SSH_KEY_TYPE} key)...")
-        encrypted = encrypt_with_ssh_key(password)
-        
-        if encrypted:
-            try:
-                with open(SSH_ENCRYPTED_FILE, 'wb') as f:
-                    f.write(encrypted)
-                os.chmod(SSH_ENCRYPTED_FILE, 0o600)
-                print(f"Password encrypted with {SSH_KEY_TYPE} key and stored in {SSH_ENCRYPTED_FILE}")
-                # Clear sensitive data from memory
-                secure_clear(password)
-                secure_clear(confirm)
-                return True
-            except Exception as e:
-                print(f"Error saving SSH encrypted file: {e}")
+
+        # For Ed25519 keys, use age if available
+        if SSH_KEY_TYPE == "Ed25519" and HAS_AGE:
+            print("Using age encryption for Ed25519 key...")
+            encrypted = encrypt_with_age(password)
+
+            if encrypted:
+                try:
+                    with open(AGE_ENCRYPTED_FILE, 'wb') as f:
+                        f.write(encrypted)
+                    os.chmod(AGE_ENCRYPTED_FILE, 0o600)
+                    print(f"Password encrypted with {SSH_KEY_TYPE} key and stored in {AGE_ENCRYPTED_FILE}")
+                    # Clear sensitive data from memory
+                    secure_clear(password)
+                    secure_clear(confirm)
+                    return True
+                except Exception as e:
+                    print(f"Error saving age encrypted file: {e}")
+
+        # For Ed25519 without age, show helpful error
+        elif SSH_KEY_TYPE == "Ed25519" and not HAS_AGE:
+            print("Error: Ed25519 keys require the 'age' encryption tool", file=sys.stderr)
+            print("Install age: https://github.com/FiloSottile/age#installation", file=sys.stderr)
+            print("Or generate an RSA key: ssh-keygen -t rsa -b 4096", file=sys.stderr)
+            return False
+
+        # For RSA/ECDSA/DSA, use OpenSSL
+        else:
+            encrypted = encrypt_with_ssh_key(password)
+
+            if encrypted:
+                try:
+                    with open(SSH_ENCRYPTED_FILE, 'wb') as f:
+                        f.write(encrypted)
+                    os.chmod(SSH_ENCRYPTED_FILE, 0o600)
+                    print(f"Password encrypted with {SSH_KEY_TYPE} key and stored in {SSH_ENCRYPTED_FILE}")
+                    # Clear sensitive data from memory
+                    secure_clear(password)
+                    secure_clear(confirm)
+                    return True
+                except Exception as e:
+                    print(f"Error saving SSH encrypted file: {e}")
     else:
         print("SSH keys not found, trying other methods...")
     
@@ -222,11 +282,16 @@ def set_password():
 
 def get_password():
     """Check for stored password in priority order"""
+    # Check age encrypted file
+    if os.path.exists(AGE_ENCRYPTED_FILE):
+        print("Password found (age encrypted with SSH key)")
+        return True
+
     # Check SSH encrypted file
     if os.path.exists(SSH_ENCRYPTED_FILE):
         print("Password found (SSH encrypted)")
         return True
-    
+
     # Check keyring
     if HAS_KEYRING:
         try:
@@ -236,14 +301,23 @@ def get_password():
                 return True
         except Exception:
             pass
-    
+
     print("No password found")
     return False
 
 def clear_password():
     """Clear all stored passwords"""
     cleared = False
-    
+
+    # Clear age encrypted file
+    if os.path.exists(AGE_ENCRYPTED_FILE):
+        try:
+            os.remove(AGE_ENCRYPTED_FILE)
+            print("Age encrypted password cleared")
+            cleared = True
+        except Exception as e:
+            print(f"Error clearing age encrypted file: {e}")
+
     # Clear SSH encrypted file
     if os.path.exists(SSH_ENCRYPTED_FILE):
         try:
