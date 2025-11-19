@@ -20,6 +20,22 @@ A secure askpass implementation using SSH key encryption for non-interactive sud
    ./askpass-manager set
    ```
 
+## Sudo Alternative for Askpass (sudo.ws)
+
+If you are using `sudo-rs` and need `askpass` functionality, you might need to
+configure `sudo.ws` as an alternative for `sudo`, as `sudo-rs` currently
+does not support `askpass`.
+
+To do this, you can use `update-alternatives`:
+
+```bash
+sudo update-alternatives --install /usr/bin/sudo sudo /usr/bin/sudo.ws 100
+# If you have other sudo alternatives, adjust the priority (100) accordingly.
+# To switch back to another sudo implementation, you can use:
+# sudo update-alternatives --config sudo
+```
+
+
 ## Usage
 
 ```bash
