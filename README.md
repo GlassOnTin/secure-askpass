@@ -78,10 +78,47 @@ If your SSH key is password-protected (recommended!), the askpass tool will:
 ## Commands
 
 ```bash
-./askpass-manager set   # Store password
-./askpass-manager get   # Check if password exists
-./askpass-manager clear # Remove password
-./askpass-manager test  # Test sudo integration
+./askpass-manager set        # Store password (GUI/terminal input)
+./askpass-manager set-totp   # Store password with TOTP verification (headless)
+./askpass-manager totp-setup # Set up TOTP for headless sessions
+./askpass-manager get        # Check if password exists
+./askpass-manager clear      # Remove password
+./askpass-manager test       # Test sudo integration
+./askpass-manager audit      # Show recent askpass usage
+```
+
+## Headless/SSH Usage with TOTP
+
+For servers or SSH sessions without a display, use TOTP authentication:
+
+### Initial Setup (run once from a GUI session)
+
+```bash
+./askpass-manager totp-setup
+```
+
+This generates a TOTP secret and displays:
+- The secret key to add to your authenticator app
+- An `otpauth://` URL you can use with any TOTP app
+
+### Setting Password from Headless Session
+
+```bash
+./askpass-manager set-totp
+```
+
+Enter your 6-digit TOTP code, then your password.
+
+### Using sudo with TOTP
+
+When `DISPLAY` is not available, the askpass script will prompt for a TOTP code:
+
+```bash
+# Interactive - prompts for TOTP code
+sudo -A command
+
+# Non-interactive - pass TOTP via environment
+TOTP="123456" sudo -A command
 ```
 
 ## License

@@ -10,6 +10,10 @@ import time
 import syslog
 import socket
 import tempfile
+import hashlib
+import hmac
+import struct
+import base64
 
 # GUI imports
 try:
@@ -42,6 +46,7 @@ AGE_ENCRYPTED_FILE = os.path.expanduser("~/.sudo_askpass.age")
 CONFIG_FILE = os.path.expanduser("~/.config/secure-askpass/config.json")
 RATE_LIMIT_FILE = os.path.expanduser("~/.config/secure-askpass/rate_limit.json")
 AUDIT_LOG_FILE = os.path.expanduser("~/.config/secure-askpass/audit.log")
+TOTP_SECRET_FILE = os.path.expanduser("~/.config/secure-askpass/totp_secret.enc")
 
 # SSH key types to try in order of preference
 SSH_KEY_TYPES = [
@@ -70,6 +75,99 @@ def find_ssh_key():
     return None, None
 
 SSH_KEY, SSH_KEY_TYPE = find_ssh_key()
+
+def load_totp_secret():
+    """Load and decrypt TOTP secret"""
+    if not os.path.exists(TOTP_SECRET_FILE):
+        return None
+
+    if not HAS_AGE or not SSH_KEY:
+        return None
+
+    try:
+        with open(TOTP_SECRET_FILE, 'rb') as f:
+            encrypted = f.read()
+
+        result = subprocess.run(
+            ['age', '-d', '-i', SSH_KEY],
+            input=encrypted,
+            capture_output=True
+        )
+
+        if result.returncode == 0:
+            return result.stdout.decode('utf-8').strip()
+    except Exception:
+        pass
+
+    return None
+
+def verify_totp(secret, provided_code, window=1):
+    """Verify TOTP code with time window tolerance"""
+    for offset in range(-window, window + 1):
+        time_step = 30
+        counter = int(time.time() // time_step) + offset
+        counter_bytes = struct.pack('>Q', counter)
+        key = base64.b32decode(secret.upper().replace(' ', ''))
+        hmac_hash = hmac.new(key, counter_bytes, hashlib.sha1).digest()
+        offset_byte = hmac_hash[-1] & 0x0f
+        code = struct.unpack('>I', hmac_hash[offset_byte:offset_byte+4])[0] & 0x7fffffff
+        expected = str(code % 1000000).zfill(6)
+        if provided_code == expected:
+            return True
+    return False
+
+def prompt_totp_confirmation():
+    """Prompt for TOTP code via terminal for headless confirmation"""
+    secret = load_totp_secret()
+    if not secret:
+        return False
+
+    command = get_sudo_command()
+    hostname = socket.gethostname()
+    user = os.environ.get('USER', 'unknown')
+
+    totp_code = None
+
+    # Method 1: Check TOTP environment variable (for automated/piped usage)
+    totp_code = os.environ.get('TOTP', '').strip()
+    if totp_code:
+        syslog.syslog(syslog.LOG_INFO, "TOTP code provided via TOTP environment variable")
+
+    # Method 2: Try to read from /dev/tty (interactive terminal)
+    if not totp_code:
+        try:
+            # Print to stderr so it doesn't interfere with password output
+            sys.stderr.write("\n" + "="*50 + "\n")
+            sys.stderr.write("SUDO AUTHENTICATION REQUIRED\n")
+            sys.stderr.write("="*50 + "\n")
+            sys.stderr.write(f"User: {user}\n")
+            sys.stderr.write(f"Host: {hostname}\n")
+            sys.stderr.write(f"Command: {command}\n")
+            sys.stderr.write("-"*50 + "\n")
+            sys.stderr.write("Enter TOTP code to authorize: ")
+            sys.stderr.flush()
+
+            with open('/dev/tty', 'r') as tty:
+                totp_code = tty.readline().strip()
+        except Exception:
+            pass
+
+    if not totp_code:
+        sys.stderr.write("No TOTP code provided. Set TOTP env var or use a terminal.\n")
+        return False
+
+    if verify_totp(secret, totp_code):
+        sys.stderr.write("TOTP verified - access granted\n")
+        sys.stderr.write("="*50 + "\n\n")
+        sys.stderr.flush()
+        syslog.syslog(syslog.LOG_INFO, "User approved sudo access via TOTP")
+        return True
+    else:
+        sys.stderr.write("Invalid TOTP code - access denied\n")
+        sys.stderr.write("="*50 + "\n\n")
+        sys.stderr.flush()
+        syslog.syslog(syslog.LOG_WARNING, "Invalid TOTP code provided")
+        return False
 
 # Default security configurations
 DEFAULT_CONFIG = {
@@ -269,9 +367,11 @@ def show_confirmation_dialog():
         except:
             pass
     
-    # If GUI is required but not available, deny by default
+    # If GUI is not available, try TOTP confirmation
     if 'DISPLAY' not in os.environ:
-        syslog.syslog(syslog.LOG_ERR, "No display available for confirmation dialog")
+        syslog.syslog(syslog.LOG_INFO, "No display available, trying TOTP confirmation")
+        return prompt_totp_confirmation()
+
     return False
 
 def check_security():

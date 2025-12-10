@@ -8,12 +8,19 @@ import subprocess
 import os
 import getpass
 import socket
+import hashlib
+import hmac
+import struct
+import time
+import base64
 
 try:
     import keyring
     HAS_KEYRING = True
 except ImportError:
     HAS_KEYRING = False
+
+TOTP_SECRET_FILE = os.path.expanduser("~/.config/secure-askpass/totp_secret.enc")
 
 SERVICE_NAME = "sudo-askpass"
 USERNAME = "sudo"
@@ -48,6 +55,199 @@ def find_ssh_keypair():
     return None, None, None
 
 SSH_KEY, SSH_PUB, SSH_KEY_TYPE = find_ssh_keypair()
+
+def generate_totp_secret():
+    """Generate a random 20-byte TOTP secret"""
+    return base64.b32encode(os.urandom(20)).decode('ascii')
+
+def get_totp_code(secret, time_step=30):
+    """Generate current TOTP code from secret"""
+    key = base64.b32decode(secret.upper().replace(' ', ''))
+    counter = int(time.time() // time_step)
+    counter_bytes = struct.pack('>Q', counter)
+    hmac_hash = hmac.new(key, counter_bytes, hashlib.sha1).digest()
+    offset = hmac_hash[-1] & 0x0f
+    code = struct.unpack('>I', hmac_hash[offset:offset+4])[0] & 0x7fffffff
+    return str(code % 1000000).zfill(6)
+
+def verify_totp(secret, provided_code, window=1):
+    """Verify TOTP code with optional time window tolerance"""
+    for offset in range(-window, window + 1):
+        time_step = 30
+        counter = int(time.time() // time_step) + offset
+        counter_bytes = struct.pack('>Q', counter)
+        key = base64.b32decode(secret.upper().replace(' ', ''))
+        hmac_hash = hmac.new(key, counter_bytes, hashlib.sha1).digest()
+        offset_byte = hmac_hash[-1] & 0x0f
+        code = struct.unpack('>I', hmac_hash[offset_byte:offset_byte+4])[0] & 0x7fffffff
+        expected = str(code % 1000000).zfill(6)
+        if provided_code == expected:
+            return True
+    return False
+
+def save_totp_secret(secret):
+    """Save TOTP secret encrypted with SSH key"""
+    if not HAS_AGE or not SSH_PUB:
+        print("Error: TOTP setup requires age and SSH keys", file=sys.stderr)
+        return False
+
+    encrypted = encrypt_with_age(secret)
+    if encrypted:
+        os.makedirs(os.path.dirname(TOTP_SECRET_FILE), exist_ok=True)
+        with open(TOTP_SECRET_FILE, 'wb') as f:
+            f.write(encrypted)
+        os.chmod(TOTP_SECRET_FILE, 0o600)
+        return True
+    return False
+
+def load_totp_secret():
+    """Load and decrypt TOTP secret"""
+    if not os.path.exists(TOTP_SECRET_FILE):
+        return None
+
+    if not HAS_AGE or not SSH_KEY:
+        return None
+
+    try:
+        with open(TOTP_SECRET_FILE, 'rb') as f:
+            encrypted = f.read()
+
+        result = subprocess.run(
+            ['age', '-d', '-i', SSH_KEY],
+            input=encrypted,
+            capture_output=True
+        )
+
+        if result.returncode == 0:
+            return result.stdout.decode('utf-8').strip()
+    except Exception:
+        pass
+
+    return None
+
+def setup_totp():
+    """Set up TOTP for headless password entry"""
+    if not HAS_AGE:
+        print("Error: TOTP requires 'age' encryption tool", file=sys.stderr)
+        print("Install: sudo apt install age", file=sys.stderr)
+        return False
+
+    if not SSH_PUB:
+        print("Error: TOTP requires SSH keys", file=sys.stderr)
+        return False
+
+    secret = generate_totp_secret()
+
+    if not save_totp_secret(secret):
+        print("Error: Failed to save TOTP secret", file=sys.stderr)
+        return False
+
+    hostname = socket.gethostname()
+    username = os.environ.get('USER', 'user')
+
+    print("\n" + "="*60)
+    print("TOTP Setup Complete!")
+    print("="*60)
+    print(f"\nSecret: {secret}")
+    print(f"\nAdd this to your authenticator app:")
+    print(f"  Account: {username}@{hostname} (sudo-askpass)")
+    print(f"  Secret:  {secret}")
+    print(f"\nOr scan this URL in your authenticator:")
+    print(f"  otpauth://totp/{username}@{hostname}:sudo-askpass?secret={secret}&issuer=secure-askpass")
+    print("\n" + "="*60)
+    print("\nYou can now use: askpass-manager set-totp")
+    print("to set your password from a headless session.")
+    print("="*60 + "\n")
+
+    return True
+
+def set_password_with_totp():
+    """Set password using TOTP verification (for headless sessions)"""
+    secret = load_totp_secret()
+
+    if not secret:
+        print("Error: TOTP not configured. Run 'askpass-manager totp-setup' first.", file=sys.stderr)
+        return False
+
+    print("TOTP-authenticated password entry (headless mode)")
+    print("-" * 50)
+
+    # Check if running interactively
+    is_tty = sys.stdin.isatty()
+
+    if is_tty:
+        totp_code = input("Enter TOTP code from authenticator: ").strip()
+    else:
+        # Read from stdin (piped input)
+        totp_code = sys.stdin.readline().strip()
+
+    if not verify_totp(secret, totp_code):
+        print("Error: Invalid TOTP code", file=sys.stderr)
+        return False
+
+    print("TOTP verified!")
+
+    if is_tty:
+        password = getpass.getpass("Enter sudo password to store: ")
+        confirm = getpass.getpass("Confirm password: ")
+    else:
+        # Read password and confirmation from stdin (piped)
+        password = sys.stdin.readline().strip()
+        confirm = sys.stdin.readline().strip()
+
+    if password != confirm:
+        print("Error: Passwords don't match", file=sys.stderr)
+        return False
+
+    return store_password_internal(password)
+
+def store_password_internal(password):
+    """Internal function to store password (shared by set and set-totp)"""
+    def secure_clear(data):
+        if data:
+            temp = bytearray(data, 'utf-8')
+            for i in range(len(temp)):
+                temp[i] = 0
+
+    if SSH_KEY and SSH_PUB:
+        if SSH_KEY_TYPE == "Ed25519" and HAS_AGE:
+            encrypted = encrypt_with_age(password)
+            if encrypted:
+                try:
+                    with open(AGE_ENCRYPTED_FILE, 'wb') as f:
+                        f.write(encrypted)
+                    os.chmod(AGE_ENCRYPTED_FILE, 0o600)
+                    print(f"Password encrypted with {SSH_KEY_TYPE} key and stored in {AGE_ENCRYPTED_FILE}")
+                    secure_clear(password)
+                    return True
+                except Exception as e:
+                    print(f"Error saving age encrypted file: {e}")
+        elif SSH_KEY_TYPE == "Ed25519" and not HAS_AGE:
+            print("Error: Ed25519 keys require the 'age' encryption tool", file=sys.stderr)
+            return False
+        else:
+            encrypted = encrypt_with_ssh_key(password)
+            if encrypted:
+                try:
+                    with open(SSH_ENCRYPTED_FILE, 'wb') as f:
+                        f.write(encrypted)
+                    os.chmod(SSH_ENCRYPTED_FILE, 0o600)
+                    print(f"Password encrypted with {SSH_KEY_TYPE} key and stored in {SSH_ENCRYPTED_FILE}")
+                    secure_clear(password)
+                    return True
+                except Exception as e:
+                    print(f"Error saving SSH encrypted file: {e}")
+
+    if HAS_KEYRING:
+        try:
+            keyring.set_password(SERVICE_NAME, USERNAME, password)
+            print("Password stored successfully in keyring")
+            return True
+        except Exception as e:
+            print(f"Keyring storage failed: {e}")
+
+    print("Error: Unable to store password securely", file=sys.stderr)
+    return False
 
 def encrypt_with_age(password):
     """Encrypt password with age using SSH public key"""
@@ -421,24 +621,35 @@ def show_audit_log():
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: askpass-manager [set|get|clear|test|audit]")
+        print("Usage: askpass-manager [set|set-totp|totp-setup|get|clear|test|audit]")
         print()
         print("Commands:")
-        print("  set   - Store password (SSH encryption by default)")
-        print("  get   - Check if password exists")
-        print("  clear - Remove stored password")
-        print("  test  - Test sudo with askpass")
-        print("  audit - Show recent askpass usage")
+        print("  set        - Store password (GUI/terminal input)")
+        print("  set-totp   - Store password with TOTP verification (headless)")
+        print("  totp-setup - Set up TOTP for headless password entry")
+        print("  get        - Check if password exists")
+        print("  clear      - Remove stored password")
+        print("  test       - Test sudo with askpass")
+        print("  audit      - Show recent askpass usage")
         print()
         print("Storage methods (secure only):")
         print("  1. SSH key encryption (supports ed25519, ecdsa, rsa, dsa)")
         print("  2. System keyring")
+        print()
+        print("For headless/SSH sessions:")
+        print("  1. Run 'totp-setup' once from a GUI session")
+        print("  2. Add the secret to your authenticator app")
+        print("  3. Use 'set-totp' from any session with TOTP code")
         sys.exit(1)
-    
+
     command = sys.argv[1]
-    
+
     if command == "set":
         success = set_password()
+    elif command == "set-totp":
+        success = set_password_with_totp()
+    elif command == "totp-setup":
+        success = setup_totp()
     elif command == "get":
         success = get_password()
     elif command == "clear":
@@ -450,7 +661,7 @@ def main():
     else:
         print(f"Unknown command: {command}", file=sys.stderr)
         success = False
-    
+
     sys.exit(0 if success else 1)
 
 if __name__ == "__main__":
