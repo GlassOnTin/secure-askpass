@@ -279,17 +279,31 @@ def check_rate_limit():
 def get_sudo_command():
     """Try to determine what command sudo is trying to run"""
     try:
-        # Get parent process command line
         ppid = os.getppid()
-        with open(f'/proc/{ppid}/cmdline', 'r') as f:
-            cmdline = f.read().replace('\0', ' ').strip()
-            # Extract the actual command after sudo flags
-            parts = cmdline.split()
-            if 'sudo' in parts[0]:
-                # Find the actual command (skip sudo and its flags)
-                for i, part in enumerate(parts):
-                    if not part.startswith('-') and part != 'sudo':
-                        return ' '.join(parts[i:])
+
+        # Try Linux /proc first
+        if os.path.exists(f'/proc/{ppid}/cmdline'):
+            with open(f'/proc/{ppid}/cmdline', 'r') as f:
+                cmdline = f.read().replace('\0', ' ').strip()
+        else:
+            # Fallback to ps command (works on macOS and other Unix-like systems)
+            result = subprocess.run(
+                ['ps', '-p', str(ppid), '-o', 'command='],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                cmdline = result.stdout.strip()
+            else:
+                return "Unknown command"
+
+        # Extract the actual command after sudo flags
+        parts = cmdline.split()
+        if parts and 'sudo' in parts[0]:
+            # Find the actual command (skip sudo and its flags)
+            for i, part in enumerate(parts):
+                if not part.startswith('-') and part != 'sudo':
+                    return ' '.join(parts[i:])
         return "Unknown command"
     except:
         return "Unknown command"
@@ -349,7 +363,7 @@ def show_confirmation_dialog():
         except Exception as e:
             syslog.syslog(syslog.LOG_WARNING, f"GTK dialog failed: {e}")
     
-    # Fallback to zenity if available
+    # Fallback to zenity if available (Linux)
     if 'DISPLAY' in os.environ:
         try:
             message = f"Administrator privileges requested\\n\\n"
@@ -357,7 +371,7 @@ def show_confirmation_dialog():
             message += f"Host: {hostname}\\n"
             message += f"Command: {command}\\n\\n"
             message += "Do you want to allow this?"
-            
+
             result = subprocess.run(
                 ['zenity', '--question', '--title=Sudo Authentication Required',
                  f'--text={message}', '--width=400'],
@@ -366,7 +380,35 @@ def show_confirmation_dialog():
             return result.returncode == 0
         except:
             pass
-    
+
+    # Try macOS native dialog with osascript
+    try:
+        import platform
+        if platform.system() == 'Darwin':
+            message = f"Administrator privileges requested\\n\\n"
+            message += f"User: {user}\\n"
+            message += f"Host: {hostname}\\n"
+            message += f"Command: {command}\\n\\n"
+            message += "Do you want to allow this?"
+
+            # Use AppleScript to show native macOS dialog
+            script = f'''
+            display dialog "{message}" ¬
+                with title "Sudo Authentication Required" ¬
+                buttons {{"Cancel", "Allow"}} ¬
+                default button "Allow" ¬
+                with icon caution
+            '''
+
+            result = subprocess.run(
+                ['osascript', '-e', script],
+                capture_output=True
+            )
+            # osascript returns 0 if "Allow" clicked, 1 if "Cancel" or dialog closed
+            return result.returncode == 0
+    except Exception as e:
+        syslog.syslog(syslog.LOG_WARNING, f"macOS dialog failed: {e}")
+
     # If GUI is not available, try TOTP confirmation
     if 'DISPLAY' not in os.environ:
         syslog.syslog(syslog.LOG_INFO, "No display available, trying TOTP confirmation")
@@ -389,12 +431,29 @@ def check_security():
     # 2. Process validation
     try:
         ppid = os.getppid()
-        proc_name = open(f'/proc/{ppid}/comm').read().strip()
-        if proc_name not in ALLOWED_PARENT_PROCESSES:
+        proc_name = None
+
+        # Try Linux /proc first
+        if os.path.exists(f'/proc/{ppid}/comm'):
+            proc_name = open(f'/proc/{ppid}/comm').read().strip()
+        else:
+            # Fallback to ps command (works on macOS and other Unix-like systems)
+            result = subprocess.run(
+                ['ps', '-p', str(ppid), '-o', 'comm='],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                proc_name = result.stdout.strip().split('/')[-1]  # Get just the process name
+
+        if proc_name and proc_name not in ALLOWED_PARENT_PROCESSES:
             syslog.syslog(syslog.LOG_WARNING, f"Askpass called by unauthorized process: {proc_name}")
             return False
-    except Exception:
-        syslog.syslog(syslog.LOG_WARNING, "Could not determine parent process")
+        elif not proc_name:
+            syslog.syslog(syslog.LOG_WARNING, "Could not determine parent process")
+            return False
+    except Exception as e:
+        syslog.syslog(syslog.LOG_WARNING, f"Could not determine parent process: {e}")
         return False
     
     # 3. Environment verification
@@ -528,16 +587,12 @@ def decrypt_with_age(encrypted_file):
     if not HAS_AGE or not SSH_KEY or not os.path.exists(SSH_KEY):
         return None
 
-    # Ensure SSH key is loaded in ssh-agent
-    if not ensure_ssh_key_loaded():
-        syslog.syslog(syslog.LOG_ERR, "Failed to load SSH key into ssh-agent")
-        return None
-
     try:
         with open(encrypted_file, 'rb') as f:
             encrypted_data = f.read()
 
-        # Use age with SSH private key identity
+        # Use age with SSH private key identity file directly
+        # Note: age can read SSH keys directly, no need for ssh-agent
         result = subprocess.run(
             ['age', '-d', '-i', SSH_KEY],
             input=encrypted_data,
@@ -546,6 +601,18 @@ def decrypt_with_age(encrypted_file):
 
         if result.returncode == 0:
             return result.stdout.decode('utf-8').strip()
+
+        # If decryption failed and key might be passphrase-protected,
+        # try to load it in ssh-agent first
+        if result.returncode != 0 and ensure_ssh_key_loaded():
+            # Retry decryption (ssh-agent might help with passphrase-protected keys)
+            result = subprocess.run(
+                ['age', '-d', '-i', SSH_KEY],
+                input=encrypted_data,
+                capture_output=True
+            )
+            if result.returncode == 0:
+                return result.stdout.decode('utf-8').strip()
 
     except Exception:
         pass
@@ -560,61 +627,84 @@ def decrypt_with_ssh_key(encrypted_file):
     try:
         with open(encrypted_file, 'rb') as f:
             encrypted_data = f.read()
-        
-        # First try direct decryption (for PKCS8 format keys)
+
+        # First try direct decryption (for PEM format keys)
         result = subprocess.run(
             ['openssl', 'pkeyutl', '-decrypt', '-inkey', SSH_KEY],
             input=encrypted_data,
             capture_output=True
         )
-        
+
         if result.returncode == 0:
             return result.stdout.decode('utf-8').strip()
-        
-        # If that fails, convert key format first using secure temp file
-        # Security fix: Use tempfile.NamedTemporaryFile to avoid predictable paths
-        # and set restrictive permissions immediately to prevent race conditions
+
+        # If that fails, key might be in OpenSSH format - convert using ssh-keygen
+        # Create a temporary PEM format copy for decryption (doesn't modify original)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as temp_file:
             temp_pem = temp_file.name
-            # Set restrictive permissions immediately
             os.chmod(temp_pem, 0o600)
-        
+
         try:
-            # Use appropriate conversion command based on key type
-            if SSH_KEY_TYPE == "RSA":
-                convert_cmd = ['openssl', 'rsa', '-in', SSH_KEY, '-out', temp_pem]
-            elif SSH_KEY_TYPE == "DSA":
-                convert_cmd = ['openssl', 'dsa', '-in', SSH_KEY, '-out', temp_pem]
-            elif SSH_KEY_TYPE == "ECDSA":
-                convert_cmd = ['openssl', 'ec', '-in', SSH_KEY, '-out', temp_pem]
-            elif SSH_KEY_TYPE == "Ed25519":
-                # Ed25519 keys are typically in PKCS8 format already
-                # Try converting from OpenSSH format to PKCS8 PEM
-                convert_cmd = ['openssl', 'pkey', '-in', SSH_KEY, '-out', temp_pem]
-            else:
-                # Generic attempt
-                convert_cmd = ['openssl', 'pkey', '-in', SSH_KEY, '-out', temp_pem]
-            
-            convert_result = subprocess.run(convert_cmd, capture_output=True)
-            
-            if convert_result.returncode == 0:
-                # Try decryption with converted key
-                result = subprocess.run(
-                    ['openssl', 'pkeyutl', '-decrypt', '-inkey', temp_pem],
-                    input=encrypted_data,
-                    capture_output=True
+            # Read the OpenSSH key and convert to PEM format
+            with open(SSH_KEY, 'rb') as f:
+                openssh_key = f.read()
+
+            # Use ssh-keygen to export in PEM format (read-only, doesn't modify source)
+            # -e exports, -m PEM sets format, -f reads from file
+            # But ssh-keygen -e exports public key, not private...
+            # We need to use a different approach
+
+            # For OpenSSH format, try using openssl with different input processing
+            # Write key content to temp file and try conversion
+            with tempfile.NamedTemporaryFile(mode='wb', suffix='.key', delete=False) as temp_key:
+                temp_key_path = temp_key.name
+                temp_key.write(openssh_key)
+                os.chmod(temp_key_path, 0o600)
+
+            try:
+                # Try converting with openssl pkey (works for OpenSSH format on some systems)
+                convert_result = subprocess.run(
+                    ['openssl', 'pkey', '-in', temp_key_path, '-traditional', '-out', temp_pem],
+                    capture_output=True,
+                    input=b''  # Empty passphrase
                 )
-                
-                if result.returncode == 0:
-                    return result.stdout.decode('utf-8').strip()
+
+                if convert_result.returncode != 0:
+                    # Try type-specific conversion
+                    if SSH_KEY_TYPE == "RSA":
+                        convert_result = subprocess.run(
+                            ['openssl', 'rsa', '-in', temp_key_path, '-out', temp_pem],
+                            capture_output=True,
+                            input=b''
+                        )
+                    elif SSH_KEY_TYPE == "ECDSA":
+                        convert_result = subprocess.run(
+                            ['openssl', 'ec', '-in', temp_key_path, '-out', temp_pem],
+                            capture_output=True,
+                            input=b''
+                        )
+
+                if convert_result.returncode == 0:
+                    # Try decryption with converted key
+                    result = subprocess.run(
+                        ['openssl', 'pkeyutl', '-decrypt', '-inkey', temp_pem],
+                        input=encrypted_data,
+                        capture_output=True
+                    )
+
+                    if result.returncode == 0:
+                        return result.stdout.decode('utf-8').strip()
+            finally:
+                if os.path.exists(temp_key_path):
+                    os.remove(temp_key_path)
         finally:
             # Always clean up temp file
             if os.path.exists(temp_pem):
                 os.remove(temp_pem)
-    
+
     except Exception:
         pass
-    
+
     return None
 
 def validate_environment():
@@ -666,22 +756,39 @@ def main():
     # Log successful security check
     try:
         ppid = os.getppid()
-        proc_name = open(f'/proc/{ppid}/comm').read().strip()
+        proc_name = None
+
+        # Try Linux /proc first
+        if os.path.exists(f'/proc/{ppid}/comm'):
+            proc_name = open(f'/proc/{ppid}/comm').read().strip()
+        else:
+            # Fallback to ps command (works on macOS and other Unix-like systems)
+            result = subprocess.run(
+                ['ps', '-p', str(ppid), '-o', 'comm='],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                proc_name = result.stdout.strip().split('/')[-1]
+
         command = get_sudo_command()
-        syslog.syslog(syslog.LOG_INFO, f"Askpass approved for {proc_name} (pid {ppid}): {command}")
-        
+        if proc_name:
+            syslog.syslog(syslog.LOG_INFO, f"Askpass approved for {proc_name} (pid {ppid}): {command}")
+        else:
+            syslog.syslog(syslog.LOG_INFO, f"Askpass approved for pid {ppid}: {command}")
+
         # Write to audit log
         from datetime import datetime
         audit_entry = {
             "timestamp": datetime.now().isoformat(),
             "pid": ppid,
-            "process": proc_name,
+            "process": proc_name or "unknown",
             "command": command,
             "user": os.environ.get('USER', 'unknown'),
             "cwd": os.getcwd(),
             "status": "approved"
         }
-        
+
         os.makedirs(os.path.dirname(AUDIT_LOG_FILE), exist_ok=True)
         with open(AUDIT_LOG_FILE, 'a') as f:
             import json

@@ -210,22 +210,21 @@ def store_password_internal(password):
                 temp[i] = 0
 
     if SSH_KEY and SSH_PUB:
-        if SSH_KEY_TYPE == "Ed25519" and HAS_AGE:
+        # Prefer age encryption for all key types if available (better compatibility)
+        if HAS_AGE:
             encrypted = encrypt_with_age(password)
             if encrypted:
                 try:
                     with open(AGE_ENCRYPTED_FILE, 'wb') as f:
                         f.write(encrypted)
                     os.chmod(AGE_ENCRYPTED_FILE, 0o600)
-                    print(f"Password encrypted with {SSH_KEY_TYPE} key and stored in {AGE_ENCRYPTED_FILE}")
+                    print(f"Password encrypted with {SSH_KEY_TYPE} key using age and stored in {AGE_ENCRYPTED_FILE}")
                     secure_clear(password)
                     return True
                 except Exception as e:
                     print(f"Error saving age encrypted file: {e}")
-        elif SSH_KEY_TYPE == "Ed25519" and not HAS_AGE:
-            print("Error: Ed25519 keys require the 'age' encryption tool", file=sys.stderr)
-            return False
-        else:
+        # Fallback to OpenSSL for RSA/ECDSA/DSA if age not available
+        elif SSH_KEY_TYPE in ["RSA", "ECDSA", "DSA"]:
             encrypted = encrypt_with_ssh_key(password)
             if encrypted:
                 try:
@@ -237,6 +236,10 @@ def store_password_internal(password):
                     return True
                 except Exception as e:
                     print(f"Error saving SSH encrypted file: {e}")
+        else:
+            print(f"Error: {SSH_KEY_TYPE} keys require the 'age' encryption tool", file=sys.stderr)
+            print("Install age: https://github.com/FiloSottile/age#installation", file=sys.stderr)
+            return False
 
     if HAS_KEYRING:
         try:
@@ -420,9 +423,9 @@ def set_password():
     if SSH_KEY and SSH_PUB:
         print(f"Using SSH key encryption ({SSH_KEY_TYPE} key)...")
 
-        # For Ed25519 keys, use age if available
-        if SSH_KEY_TYPE == "Ed25519" and HAS_AGE:
-            print("Using age encryption for Ed25519 key...")
+        # Prefer age encryption for all key types if available (better compatibility, especially on macOS)
+        if HAS_AGE:
+            print("Using age encryption...")
             encrypted = encrypt_with_age(password)
 
             if encrypted:
@@ -430,7 +433,7 @@ def set_password():
                     with open(AGE_ENCRYPTED_FILE, 'wb') as f:
                         f.write(encrypted)
                     os.chmod(AGE_ENCRYPTED_FILE, 0o600)
-                    print(f"Password encrypted with {SSH_KEY_TYPE} key and stored in {AGE_ENCRYPTED_FILE}")
+                    print(f"Password encrypted with {SSH_KEY_TYPE} key using age and stored in {AGE_ENCRYPTED_FILE}")
                     # Clear sensitive data from memory
                     secure_clear(password)
                     secure_clear(confirm)
@@ -438,15 +441,8 @@ def set_password():
                 except Exception as e:
                     print(f"Error saving age encrypted file: {e}")
 
-        # For Ed25519 without age, show helpful error
-        elif SSH_KEY_TYPE == "Ed25519" and not HAS_AGE:
-            print("Error: Ed25519 keys require the 'age' encryption tool", file=sys.stderr)
-            print("Install age: https://github.com/FiloSottile/age#installation", file=sys.stderr)
-            print("Or generate an RSA key: ssh-keygen -t rsa -b 4096", file=sys.stderr)
-            return False
-
-        # For RSA/ECDSA/DSA, use OpenSSL
-        else:
+        # Fallback to OpenSSL for RSA/ECDSA/DSA if age not available
+        elif SSH_KEY_TYPE in ["RSA", "ECDSA", "DSA"]:
             encrypted = encrypt_with_ssh_key(password)
 
             if encrypted:
@@ -461,6 +457,10 @@ def set_password():
                     return True
                 except Exception as e:
                     print(f"Error saving SSH encrypted file: {e}")
+        else:
+            print(f"Error: {SSH_KEY_TYPE} keys require the 'age' encryption tool", file=sys.stderr)
+            print("Install age: https://github.com/FiloSottile/age#installation", file=sys.stderr)
+            return False
     else:
         print("SSH keys not found, trying other methods...")
     
