@@ -1,0 +1,27 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install cryptography
+
+      - name: Run security tests
+        run: python3 test_security.py
+
+      - name: Run android auth tests (Python)
+        run: python3 test_android_auth.py
+
+      - name: Run android auth tests (bash)
+        run: bash test_android_auth.sh
