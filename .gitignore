@@ -38,6 +38,12 @@ ENV/
 /tmp/sudo_command
 /tmp/sudo_response
 
+# Android
+android_companion/.gradle/
+android_companion/local.properties
+android_companion/app/build/
+android_companion/.idea/
+
 # System
 .DS_Store
 Thumbs.db
