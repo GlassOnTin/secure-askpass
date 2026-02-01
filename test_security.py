@@ -10,14 +10,15 @@ import subprocess
 from datetime import datetime, timedelta
 
 # Add the secure-askpass directory to the path
-sys.path.insert(0, '/home/ian/secure-askpass')
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
 
 def test_temp_file_security():
     """Test that temp files are created securely"""
     print("Testing temp file security...")
     
     # Check that the code uses tempfile module
-    with open('/home/ian/secure-askpass/askpass', 'r') as f:
+    with open(os.path.join(SCRIPT_DIR, 'askpass'), 'r') as f:
         content = f.read()
         assert 'import tempfile' in content, "tempfile module not imported"
         assert 'tempfile.NamedTemporaryFile' in content, "Not using NamedTemporaryFile"
@@ -76,7 +77,7 @@ def test_sudo_command():
     
     # Set up environment for sudo
     env = os.environ.copy()
-    env['SUDO_ASKPASS'] = '/home/ian/secure-askpass/askpass'
+    env['SUDO_ASKPASS'] = os.path.join(SCRIPT_DIR, 'askpass')
     
     # Test with a simple command (will fail due to no password, but tests execution)
     try:
