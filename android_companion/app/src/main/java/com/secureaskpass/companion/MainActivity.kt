@@ -1,18 +1,23 @@
 package com.secureaskpass.companion
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.google.mlkit.vision.barcode.BarcodeScanning
+import androidx.core.content.ContextCompat
 import kotlin.concurrent.thread
 
 /**
@@ -23,19 +28,50 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var pairingManager: PairingManager
 
+    @androidx.camera.core.ExperimentalGetImage
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         pairingManager = PairingManager(this)
 
         setContent {
             MaterialTheme {
-                MainScreen(
-                    isPaired = pairingManager.isPaired(),
-                    pairedHost = pairingManager.getPairedHost()?.hostname ?: "",
-                    onScanQr = { /* Launch QR scanner - simplified for now */ },
-                    onManualPair = { json -> doPair(json) },
-                    onUnpair = { doUnpair() }
-                )
+                var showScanner by remember { mutableStateOf(false) }
+
+                val permissionLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.RequestPermission()
+                ) { granted ->
+                    if (granted) {
+                        showScanner = true
+                    } else {
+                        Toast.makeText(this, "Camera permission required", Toast.LENGTH_SHORT).show()
+                    }
+                }
+
+                if (showScanner) {
+                    QrScannerScreen(
+                        onQrScanned = { json ->
+                            showScanner = false
+                            doPair(json)
+                        },
+                        onCancel = { showScanner = false }
+                    )
+                } else {
+                    MainScreen(
+                        isPaired = pairingManager.isPaired(),
+                        pairedHost = pairingManager.getPairedHost()?.hostname ?: "",
+                        onScanQr = {
+                            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                                == PackageManager.PERMISSION_GRANTED
+                            ) {
+                                showScanner = true
+                            } else {
+                                permissionLauncher.launch(Manifest.permission.CAMERA)
+                            }
+                        },
+                        onManualPair = { json -> doPair(json) },
+                        onUnpair = { doUnpair() }
+                    )
+                }
             }
         }
 
